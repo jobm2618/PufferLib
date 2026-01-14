@@ -34,7 +34,7 @@ int demo() {
     // Allocate memory
     init(&env);
 
-    // Allocate action/reward arrays (not shared with Python in standalone mode)
+    // Allocate action/reward arrays
     env.actions = (int*)calloc(env.num_agents, sizeof(int));
     env.rewards = (float*)calloc(env.num_agents, sizeof(float));
     env.terminals = (unsigned char*)calloc(env.num_agents, sizeof(unsigned char));
@@ -64,8 +64,9 @@ int demo() {
     return 0;
 }
 
-/* Performance benchmark
- * Note: bomberman.py already has test_performance(), this is for standalone C testing
+/* Performance benchmark (standalone C only)
+ * Tests raw C performance without Python overhead.
+ * For integrated testing, use bomberman.py test_performance() instead.
  */
 void test_performance(float test_time) {
     Bomberman env;

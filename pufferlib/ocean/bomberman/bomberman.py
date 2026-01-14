@@ -292,7 +292,11 @@ class Bomberman(pufferlib.PufferEnv):
 
 
 def test_performance(timeout=10, atn_cache=1024):
-    """Performance benchmark: measure steps per second (SPS).
+    """Performance benchmark for training pipeline (Python + C integration).
+
+    Tests the full Python API with vectorized environments to measure
+    realistic training performance including Python overhead.
+    For C-only benchmark, use bomberman.c test_performance().
 
     Args:
         timeout: Run for this many seconds

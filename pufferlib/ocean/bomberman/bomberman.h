@@ -19,16 +19,14 @@
 #define NUM_SPATIAL_CHANNELS 8
 #define CH_WALLS 0
 #define CH_BLOCKS 1
-#define CH_OTHERS 2            // Renumbered from 3
-#define CH_BOMBS 3             // Renumbered from 4
-#define CH_FIRES 4             // Renumbered from 5
-#define CH_POWERUP_BOMB 5      // Bomb count power-up (Phase 3) - Renumbered from 6
-#define CH_POWERUP_BLAST 6     // Blast radius power-up (Phase 3) - Renumbered from 7
-#define CH_POWERUP_SPEED 7     // Speed power-up (Phase 3) - Renumbered from 8
+#define CH_OTHERS 2            
+#define CH_BOMBS 3            
+#define CH_FIRES 4            
+#define CH_POWERUP_BOMB 5      // Bomb count power-up (Phase 3)
+#define CH_POWERUP_BLAST 6     // Blast radius power-up (Phase 3) 
+#define CH_POWERUP_SPEED 7     // Speed power-up (Phase 3)
 
 // Scalar features (appended after spatial)
-// Scalar features (4 values appended after spatial)
-// Note: Survival progress removed - only needed for reward calculation, not observation
 #define NUM_SCALAR_FEATURES 4
 #define SCALAR_LIVES 0          // Remaining lives (normalized to 0.33, 0.67, 1.0)
 #define SCALAR_BOMB_COUNT 1     // Current/max bombs
@@ -55,11 +53,11 @@
  * and reported to Python every log_interval ticks.
  */
 typedef struct {
-    float perf;              // Performance metric: (kills - deaths) / episode_length
-    float score;             // Raw score: kills - deaths
+    float perf;              // Performance metric (environment-specific, unused)
+    float score;             // Score metric (environment-specific, unused)
     float episode_return;    // Sum of rewards over episode
-    float episode_length;    // Number of steps in episode
-    float n;                 // Required as the last field (episode count)
+    float episode_length;    // Total steps across all agent episodes
+    float n;                 // Number of completed agent episodes (for averaging metrics)
 } Log;
 
 /* Agent state
@@ -83,7 +81,7 @@ typedef struct {
 typedef struct {
     int x, y;                // Position in grid
     int timer;               // Ticks until explosion (-1 = inactive slot)
-    int owner;               // Agent index who placed it
+    int owner;               // Agent index who placed it (for inventory return + kill credit)
     int blast_radius;        // Explosion radius in cells
 } Bomb;
 
@@ -94,7 +92,7 @@ typedef struct {
 typedef struct {
     int x, y;                // Position in grid
     int remaining_ticks;     // How long fire persists (-1 = inactive slot)
-    int owner;               // Agent index of bomb owner (for kill credit)
+    int owner;               // Agent index of bomb owner (reserved for future kill tracking)
 } Fire;
 
 /* PowerUp state (Phase 3 feature, observation channels added now)
@@ -116,12 +114,8 @@ typedef struct {
     Texture2D fire_tex;      // Fire sprite
 } Client;
 
-/* Main environment struct
- * Contains all game state and shared buffers with Python
- *
- * Memory layout optimized for cache efficiency:
- * - Hot data (accessed every step) grouped together
- * - Configuration data (read-only) at end
+/* 
+Main environment struct
  */
 typedef struct {
     // === LOGGING (updated every step) ===
@@ -233,8 +227,6 @@ void spawn_agent(Bomberman* env, int agent_idx);
  */
 void generate_map(Bomberman* env);
 
-// === IMPLEMENTATION ===
-// Implementation in header (PufferLib pattern for single-file envs)
 
 /* === INITIALIZATION === */
 
@@ -483,7 +475,6 @@ void explode_bomb(Bomberman* env, int bomb_idx) {
             // Destroy soft walls and stop propagation
             if (cell == SOFT_WALL) {
                 env->grid[grid_idx] = EMPTY;
-                // No reward for block destruction - only placement + survival rewards at elimination
                 break;  // Don't propagate through blocks
             }
 
@@ -537,6 +528,12 @@ void damage_agent(Bomberman* env, int agent_idx, int killer_idx) {
         agent->alive = false;
         env->terminals[agent_idx] = 1;
         env->agents_alive--;
+
+        // Remove from grid (agents can't occupy cells when dead)
+        int grid_idx = agent->y * env->width + agent->x;
+        if (env->grid[grid_idx] == AGENT_ID_OFFSET + agent_idx) {
+            env->grid[grid_idx] = EMPTY;
+        }
 
         // Calculate placement (reverse rank)
         // First eliminated = rank N (worst), last surviving = rank 1 (winner)
@@ -736,10 +733,11 @@ void c_reset(Bomberman* env) {
 void c_step(Bomberman* env) {
     env->tick++;
 
-    // 1. Clear per-step state (no per-step rewards)
+    // 1. Clear per-step state (rewards only - terminals persist once set)
     for (int a = 0; a < env->num_agents; a++) {
         env->rewards[a] = 0.0f;
-        env->terminals[a] = 0;
+        // NOTE: Do NOT reset terminals - they persist once an agent is eliminated
+        // env->terminals[a] is set to 1 in damage_agent() when remaining_lives <= 0
 
         // Increment episode length for alive agents
         if (env->agents[a].alive) {
@@ -791,7 +789,11 @@ void c_step(Bomberman* env) {
                 break;
         }
 
-        // Movement
+        // Movement (track old position and whether movement succeeded)
+        int old_x = agent->x;
+        int old_y = agent->y;
+        bool moved = false;
+
         if (move_dir >= 0) {
             int dx[] = {0, 0, -1, 1};
             int dy[] = {-1, 1, 0, 0};
@@ -808,13 +810,23 @@ void c_step(Bomberman* env) {
                 if (cell == EMPTY) {
                     agent->x = new_x;
                     agent->y = new_y;
+                    moved = true;
                 }
             }
         }
 
-        // Bomb placement
-        if (place_bomb_action) {
+        // Bomb placement - only if agent moved (bomb goes at OLD position)
+        // Classic Bomberman: agent can't occupy same cell as bomb
+        if (place_bomb_action && moved) {
+            // Temporarily restore old position for place_bomb
+            int saved_x = agent->x;
+            int saved_y = agent->y;
+            agent->x = old_x;
+            agent->y = old_y;
             place_bomb(env, a);
+            // Restore new position
+            agent->x = saved_x;
+            agent->y = saved_y;
         }
     }
 
@@ -846,7 +858,52 @@ void c_step(Bomberman* env) {
         }
     }
 
-    // 6. Compute observations
+    // 6. Victory condition: If only 1 agent alive, they win
+    if (env->agents_alive == 1) {
+        // Find the winner
+        for (int a = 0; a < env->num_agents; a++) {
+            if (env->agents[a].alive) {
+                Agent* winner = &env->agents[a];
+
+                // Mark as winner (rank 1, best placement)
+                winner->rank = 1;
+                env->agents_eliminated++;
+                winner->alive = false;
+                env->terminals[a] = 1;
+                env->agents_alive--;
+
+                // Remove from grid
+                int grid_idx = winner->y * env->width + winner->x;
+                if (env->grid[grid_idx] == AGENT_ID_OFFSET + a) {
+                    env->grid[grid_idx] = EMPTY;
+                }
+
+                // Winner gets best placement reward + survival reward
+                float placement_reward = (float)(env->num_agents - winner->rank) / (float)env->num_agents;
+                Log* winner_log = &env->agent_logs[a];
+                float survival_reward = (float)winner_log->episode_length / (float)env->tick;
+                float total_reward = placement_reward + survival_reward;
+
+                env->rewards[a] += total_reward;
+                env->agent_logs[a].episode_return += total_reward;
+
+                // Update episode log
+                winner_log->score = total_reward;
+                winner_log->perf = winner_log->episode_length > 0 ? winner_log->score / winner_log->episode_length : 0.0f;
+
+                // Add to aggregate log
+                env->log.perf += winner_log->perf;
+                env->log.score += winner_log->score;
+                env->log.episode_return += winner_log->episode_return;
+                env->log.episode_length += winner_log->episode_length;
+                env->log.n += 1;
+
+                break;  // Only one winner
+            }
+        }
+    }
+
+    // 7. Compute observations
     compute_observations(env);
 }
 
@@ -874,7 +931,7 @@ void c_render(Bomberman* env) {
     if (env->client == NULL) {
         int window_width = env->width * 32;
         int window_height = env->height * 32;
-        InitWindow(window_width, window_height, "PufferLib Bomberman");
+        InitWindow(window_width, window_height, "Bomberman");
         SetTargetFPS(10);
         env->client = (Client*)calloc(1, sizeof(Client));
     }
