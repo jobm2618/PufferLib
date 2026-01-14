@@ -37,7 +37,7 @@
 #define SPATIAL_SIZE (11 * 11 * NUM_SPATIAL_CHANNELS)  // 968
 #define TOTAL_OBS_SIZE (SPATIAL_SIZE + NUM_SCALAR_FEATURES)  // 972
 
-// Actions
+// Actions: 0=noop, 1-4=move, 5-8=move+bomb
 #define ACTION_NOOP 0
 #define ACTION_UP 1
 #define ACTION_DOWN 2
@@ -47,14 +47,23 @@
 #define ACTION_DOWN_BOMB 6
 #define ACTION_LEFT_BOMB 7
 #define ACTION_RIGHT_BOMB 8
+#define NUM_ACTIONS 9
+
+// Action lookup tables: action -> move direction (-1=none, 0=up, 1=down, 2=left, 3=right)
+static const int ACTION_MOVE_DIR[NUM_ACTIONS] = {-1, 0, 1, 2, 3, 0, 1, 2, 3};
+static const int ACTION_HAS_BOMB[NUM_ACTIONS] = {0, 0, 0, 0, 0, 1, 1, 1, 1};
+
+// Movement direction vectors
+static const int DIR_DX[4] = {0, 0, -1, 1};
+static const int DIR_DY[4] = {-1, 1, 0, 0};
 
 /* Required logging struct - only use floats!
  * These metrics are averaged across all environments
  * and reported to Python every log_interval ticks.
  */
 typedef struct {
-    float perf;              // Performance metric (environment-specific, unused)
-    float score;             // Score metric (environment-specific, unused)
+    float perf;              // Performance metric (environment-specific, unused for now)
+    float score;             // Score metric (environment-specific, unused for now)
     float episode_return;    // Sum of rewards over episode
     float episode_length;    // Total steps across all agent episodes
     float n;                 // Number of completed agent episodes (for averaging metrics)
@@ -155,6 +164,14 @@ typedef struct {
     int tick;                    // Current game tick
     int max_ticks;               // Maximum ticks per episode (for battle royale)
 
+    // === SHRINKING MAP (Phase 5 - Battle Royale) ===
+    int shrink_start_tick;       // Tick when shrinking begins (calculated at reset)
+    int shrink_rate;             // Ticks between shrink steps (2 = slow enough to outrun)
+    int shrink_radius;           // Current safe zone radius (Manhattan distance from center)
+    int shrink_center_x;         // Random target center X
+    int shrink_center_y;         // Random target center Y
+    int shrink_active;           // 0=not started, 1=shrinking
+
     // === RENDERING (only used if render() called) ===
     Client* client;              // Raylib client (NULL until first render)
 } Bomberman;
@@ -217,6 +234,16 @@ int check_fire_collision(Bomberman* env, int x, int y);
  */
 void damage_agent(Bomberman* env, int agent_idx, int killer_idx);
 
+/* Finalize agent's episode (award rewards, update logs)
+ * Called when agent is eliminated or wins
+ */
+void finalize_agent(Bomberman* env, int agent_idx, int rank);
+
+/* Clear all entity arrays (bombs, fires, powerups)
+ * Used in init() and c_reset()
+ */
+void clear_entities(Bomberman* env);
+
 /* Spawn agent at random empty position
  * Used at reset and respawn (if implemented)
  */
@@ -247,16 +274,8 @@ void init(Bomberman* env) {
     env->agents_alive = env->num_agents;
     env->agents_eliminated = 0;
 
-    // Mark all bombs/fires/powerups as inactive
-    for (int i = 0; i < env->max_bombs; i++) {
-        env->bombs[i].timer = -1;
-    }
-    for (int i = 0; i < env->max_fires; i++) {
-        env->fires[i].remaining_ticks = -1;
-    }
-    for (int i = 0; i < env->max_powerups; i++) {
-        env->powerups[i].active = 0;
-    }
+    // Mark all entities as inactive
+    clear_entities(env);
 
     // Initialize rendering client as NULL (created on first render)
     env->client = NULL;
@@ -276,6 +295,14 @@ void generate_map(Bomberman* env) {
     for (int y = 0; y < env->height; y++) {
         env->grid[y * env->width + 0] = HARD_WALL;  // Left
         env->grid[y * env->width + (env->width - 1)] = HARD_WALL;  // Right
+    }
+
+    // Create classic Bomberman interior hard wall grid pattern
+    // Hard walls at every even (x, y) position in the interior
+    for (int y = 2; y < env->height - 1; y += 2) {
+        for (int x = 2; x < env->width - 1; x += 2) {
+            env->grid[y * env->width + x] = HARD_WALL;
+        }
     }
 
     // Place soft blocks with symmetric mirroring (fairness for all spawn corners)
@@ -355,39 +382,46 @@ void generate_map(Bomberman* env) {
 void spawn_agent(Bomberman* env, int agent_idx) {
     Agent* agent = &env->agents[agent_idx];
 
-    // Spawn in corners (distribute evenly)
-    // For 4 agents: corners. For 8 agents: corners + midpoints. Etc.
-    int spawn_idx = agent_idx % 4;
+    // Distribute agents evenly around the grid perimeter
+    // Perimeter length: 2*(width-2) + 2*(height-2) = 2*width + 2*height - 8
+    // We use the inner ring (1 cell from border) for spawning
+    int inner_width = env->width - 2;   // Walkable width (excluding walls)
+    int inner_height = env->height - 2; // Walkable height (excluding walls)
+
+    // Perimeter of inner walkable area
+    // Top edge: inner_width cells, Right edge: inner_height-1, Bottom: inner_width-1, Left: inner_height-2
+    int perimeter = 2 * inner_width + 2 * inner_height - 4;
+
+    // Calculate position along perimeter for this agent
+    int pos = (agent_idx * perimeter) / env->num_agents;
+
     int x, y;
 
-    switch (spawn_idx) {
-        case 0:  // Top-left
-            x = 1;
-            y = 1;
-            break;
-        case 1:  // Top-right
-            x = env->width - 2;
-            y = 1;
-            break;
-        case 2:  // Bottom-left
-            x = 1;
-            y = env->height - 2;
-            break;
-        case 3:  // Bottom-right
-            x = env->width - 2;
-            y = env->height - 2;
-            break;
+    if (pos < inner_width) {
+        // Top edge: left to right
+        x = 1 + pos;
+        y = 1;
+    } else if (pos < inner_width + inner_height - 1) {
+        // Right edge: top to bottom
+        x = env->width - 2;
+        y = 1 + (pos - inner_width);
+    } else if (pos < 2 * inner_width + inner_height - 2) {
+        // Bottom edge: right to left
+        x = env->width - 2 - (pos - inner_width - inner_height + 1);
+        y = env->height - 2;
+    } else {
+        // Left edge: bottom to top
+        x = 1;
+        y = env->height - 2 - (pos - 2 * inner_width - inner_height + 2);
     }
 
-    // Offset slightly for multiple agents at same corner
-    int corner_offset = agent_idx / 4;
-    if (corner_offset > 0) {
-        x += (corner_offset % 2) * 2 - 1;  // Wiggle x
-        y += (corner_offset / 2) * 2 - 1;  // Wiggle y
-
-        // Clamp to valid range
-        x = x < 1 ? 1 : (x >= env->width - 1 ? env->width - 2 : x);
-        y = y < 1 ? 1 : (y >= env->height - 1 ? env->height - 2 : y);
+    // Ensure we don't spawn on hard walls (classic Bomberman grid pattern at even x,y)
+    // If position is on a hard wall, nudge to nearest odd position
+    if (x > 1 && x < env->width - 2 && x % 2 == 0) {
+        x = (x + 1 < env->width - 2) ? x + 1 : x - 1;
+    }
+    if (y > 1 && y < env->height - 2 && y % 2 == 0) {
+        y = (y + 1 < env->height - 2) ? y + 1 : y - 1;
     }
 
     agent->x = x;
@@ -453,15 +487,11 @@ void explode_bomb(Bomberman* env, int bomb_idx) {
         env->agents[owner].bomb_count++;
     }
 
-    // Directions: up, down, left, right
-    int dx[] = {0, 0, -1, 1};
-    int dy[] = {-1, 1, 0, 0};
-
-    // Propagate fire in 4 directions
+    // Propagate fire in 4 directions (uses global DIR_DX/DIR_DY)
     for (int dir = 0; dir < 4; dir++) {
         for (int dist = 0; dist <= radius; dist++) {
-            int x = center_x + dx[dir] * dist;
-            int y = center_y + dy[dir] * dist;
+            int x = center_x + DIR_DX[dir] * dist;
+            int y = center_y + DIR_DY[dir] * dist;
 
             // Check bounds
             if (x < 0 || x >= env->width || y < 0 || y >= env->height) break;
@@ -475,6 +505,21 @@ void explode_bomb(Bomberman* env, int bomb_idx) {
             // Destroy soft walls and stop propagation
             if (cell == SOFT_WALL) {
                 env->grid[grid_idx] = EMPTY;
+
+                // Phase 3: Spawn power-up (30% chance)
+                if ((rand() % 100) < 30) {
+                    // Find inactive power-up slot
+                    for (int p = 0; p < env->max_powerups; p++) {
+                        if (env->powerups[p].active == 0) {
+                            env->powerups[p].x = x;
+                            env->powerups[p].y = y;
+                            env->powerups[p].type = rand() % 3;  // 0=bomb, 1=radius, 2=speed
+                            env->powerups[p].active = 1;
+                            break;
+                        }
+                    }
+                }
+
                 break;  // Don't propagate through blocks
             }
 
@@ -524,51 +569,63 @@ void damage_agent(Bomberman* env, int agent_idx, int killer_idx) {
 
     // Check if agent is eliminated (0 lives remaining)
     if (agent->remaining_lives <= 0) {
-        // Mark as dead
-        agent->alive = false;
-        env->terminals[agent_idx] = 1;
-        env->agents_alive--;
-
-        // Remove from grid (agents can't occupy cells when dead)
-        int grid_idx = agent->y * env->width + agent->x;
-        if (env->grid[grid_idx] == AGENT_ID_OFFSET + agent_idx) {
-            env->grid[grid_idx] = EMPTY;
-        }
-
-        // Calculate placement (reverse rank)
-        // First eliminated = rank N (worst), last surviving = rank 1 (winner)
-        agent->rank = env->num_agents - env->agents_eliminated;
-        env->agents_eliminated++;
-
-        // Placement reward (linear): (N - rank) / N
-        // Example: Rank 1 of 8 → (8-1)/8 = 0.875 (winner)
-        // Example: Rank 8 of 8 → (8-8)/8 = 0.0 (first out)
-        float placement_reward = (float)(env->num_agents - agent->rank) / (float)env->num_agents;
-
-        // Survival reward: (agent's steps survived) / (total game ticks so far)
-        // Uses agent's episode_length for steps, env->tick for game ticks
-        // Example: Agent survived 100 steps in a 150-tick game → 100/150 = 0.67
-        Log* agent_log = &env->agent_logs[agent_idx];
-        float survival_reward = (float)agent_log->episode_length / (float)env->tick;
-
-        // Total reward at elimination
-        float total_reward = placement_reward + survival_reward;
-        env->rewards[agent_idx] += total_reward;
-        env->agent_logs[agent_idx].episode_return += total_reward;
-
-        // Update episode log
-        Log* log = &env->agent_logs[agent_idx];
-        log->score = total_reward;  // Use total reward as score
-        log->perf = log->episode_length > 0 ? log->score / log->episode_length : 0.0f;
-
-        // Add to aggregate log
-        env->log.perf += log->perf;
-        env->log.score += log->score;
-        env->log.episode_return += log->episode_return;
-        env->log.episode_length += log->episode_length;
-        env->log.n += 1;
+        // Calculate rank: first eliminated = N (worst), last = 1 (best)
+        int rank = env->num_agents - env->agents_eliminated;
+        finalize_agent(env, agent_idx, rank);
     }
-    // If lives > 0, agent survives this hit (optional: add brief invulnerability here)
+    // If lives > 0, agent survives this hit
+}
+
+/* === HELPER FUNCTIONS === */
+
+void finalize_agent(Bomberman* env, int agent_idx, int rank) {
+    Agent* agent = &env->agents[agent_idx];
+    Log* agent_log = &env->agent_logs[agent_idx];
+
+    // Set final state
+    agent->rank = rank;
+    agent->alive = false;
+    env->terminals[agent_idx] = 1;
+    env->agents_alive--;
+    env->agents_eliminated++;
+
+    // Remove from grid
+    int grid_idx = agent->y * env->width + agent->x;
+    if (env->grid[grid_idx] == AGENT_ID_OFFSET + agent_idx) {
+        env->grid[grid_idx] = EMPTY;
+    }
+
+    // Calculate rewards
+    // Placement: (N - rank) / N  →  rank 1 = best, rank N = worst
+    float placement_reward = (float)(env->num_agents - rank) / (float)env->num_agents;
+    // Survival: steps_survived / total_ticks
+    float survival_reward = (env->tick > 0) ? (float)agent_log->episode_length / (float)env->tick : 0.0f;
+    float total_reward = placement_reward + survival_reward;
+
+    // Apply rewards
+    env->rewards[agent_idx] += total_reward;
+    agent_log->episode_return += total_reward;
+    agent_log->score = total_reward;
+    agent_log->perf = agent_log->episode_length > 0 ? agent_log->score / agent_log->episode_length : 0.0f;
+
+    // Add to aggregate log
+    env->log.perf += agent_log->perf;
+    env->log.score += agent_log->score;
+    env->log.episode_return += agent_log->episode_return;
+    env->log.episode_length += agent_log->episode_length;
+    env->log.n += 1;
+}
+
+void clear_entities(Bomberman* env) {
+    for (int i = 0; i < env->max_bombs; i++) {
+        env->bombs[i].timer = -1;
+    }
+    for (int i = 0; i < env->max_fires; i++) {
+        env->fires[i].remaining_ticks = -1;
+    }
+    for (int i = 0; i < env->max_powerups; i++) {
+        env->powerups[i].active = 0;
+    }
 }
 
 /* === OBSERVATION COMPUTATION === */
@@ -650,11 +707,22 @@ void compute_observations(Bomberman* env) {
                 }
                 env->observations[obs_idx++] = fire_val;
 
-                // Channels 5-7: Power-ups (Phase 3 - currently always 0)
+                // Channels 5-7: Power-ups (Phase 3)
                 float powerup_bomb = 0.0f;
                 float powerup_blast = 0.0f;
                 float powerup_speed = 0.0f;
-                // TODO Phase 3: Check env->powerups array for power-ups at (x, y)
+
+                // Check for power-ups at this position
+                for (int p = 0; p < env->max_powerups; p++) {
+                    if (env->powerups[p].active &&
+                        env->powerups[p].x == x && env->powerups[p].y == y) {
+                        if (env->powerups[p].type == 0) powerup_bomb = 1.0f;
+                        else if (env->powerups[p].type == 1) powerup_blast = 1.0f;
+                        else if (env->powerups[p].type == 2) powerup_speed = 1.0f;
+                        break;
+                    }
+                }
+
                 env->observations[obs_idx++] = powerup_bomb;
                 env->observations[obs_idx++] = powerup_blast;
                 env->observations[obs_idx++] = powerup_speed;
@@ -707,22 +775,32 @@ void c_reset(Bomberman* env) {
         spawn_agent(env, i);
     }
 
-    // Clear bombs, fires, and power-ups
-    for (int i = 0; i < env->max_bombs; i++) {
-        env->bombs[i].timer = -1;
-    }
-    for (int i = 0; i < env->max_fires; i++) {
-        env->fires[i].remaining_ticks = -1;
-    }
-    for (int i = 0; i < env->max_powerups; i++) {
-        env->powerups[i].active = 0;
-    }
+    // Clear all entities
+    clear_entities(env);
 
     // Clear rewards and terminals
     for (int i = 0; i < env->num_agents; i++) {
         env->rewards[i] = 0.0f;
         env->terminals[i] = 0;
     }
+
+    // Initialize shrinking map (Phase 5)
+    // Calculate shrink_start_tick based on time for agents to break all soft walls
+    // Formula: (soft_walls / num_agents) * (bomb_timer + explosion_duration) * 1.5
+    int interior_cells = (env->width - 2) * (env->height - 2);
+    int soft_walls = (int)(interior_cells * env->block_density);
+    int walls_per_agent = soft_walls / env->num_agents;
+    int ticks_per_wall = env->bomb_timer + env->explosion_duration;  // 5 + 3 = 8
+    int base_time = walls_per_agent * ticks_per_wall;
+    env->shrink_start_tick = (int)(base_time * 1.5f);
+
+    env->shrink_rate = 2;  // Shrink every 2 ticks (slow enough to outrun)
+    env->shrink_radius = (env->width + env->height) / 2;  // Start with large radius
+    env->shrink_active = 0;
+
+    // Random shrink center (within interior, not on walls)
+    env->shrink_center_x = 1 + (rand() % (env->width - 2));
+    env->shrink_center_y = 1 + (rand() % (env->height - 2));
 
     // Compute initial observations
     compute_observations(env);
@@ -751,62 +829,26 @@ void c_step(Bomberman* env) {
 
         Agent* agent = &env->agents[a];
         int action = env->actions[a];
+        if (action < 0 || action >= NUM_ACTIONS) continue;
 
-        // Extract movement and bomb components
-        int move_dir = -1;
-        bool place_bomb_action = false;
+        // Lookup action components
+        int move_dir = ACTION_MOVE_DIR[action];
+        bool wants_bomb = ACTION_HAS_BOMB[action];
 
-        switch (action) {
-            case ACTION_NOOP:
-                break;
-            case ACTION_UP:
-                move_dir = 0;
-                break;
-            case ACTION_DOWN:
-                move_dir = 1;
-                break;
-            case ACTION_LEFT:
-                move_dir = 2;
-                break;
-            case ACTION_RIGHT:
-                move_dir = 3;
-                break;
-            case ACTION_UP_BOMB:
-                move_dir = 0;
-                place_bomb_action = true;
-                break;
-            case ACTION_DOWN_BOMB:
-                move_dir = 1;
-                place_bomb_action = true;
-                break;
-            case ACTION_LEFT_BOMB:
-                move_dir = 2;
-                place_bomb_action = true;
-                break;
-            case ACTION_RIGHT_BOMB:
-                move_dir = 3;
-                place_bomb_action = true;
-                break;
-        }
-
-        // Movement (track old position and whether movement succeeded)
+        // Track old position for bomb placement
         int old_x = agent->x;
         int old_y = agent->y;
         bool moved = false;
 
+        // Movement
         if (move_dir >= 0) {
-            int dx[] = {0, 0, -1, 1};
-            int dy[] = {-1, 1, 0, 0};
-            int new_x = agent->x + dx[move_dir];
-            int new_y = agent->y + dy[move_dir];
+            int new_x = agent->x + DIR_DX[move_dir];
+            int new_y = agent->y + DIR_DY[move_dir];
 
             // Check bounds and collisions
             if (new_x >= 0 && new_x < env->width &&
                 new_y >= 0 && new_y < env->height) {
-                int grid_idx = new_y * env->width + new_x;
-                char cell = env->grid[grid_idx];
-
-                // Can move if empty or has fire (will die from fire later)
+                char cell = env->grid[new_y * env->width + new_x];
                 if (cell == EMPTY) {
                     agent->x = new_x;
                     agent->y = new_y;
@@ -815,18 +857,48 @@ void c_step(Bomberman* env) {
             }
         }
 
-        // Bomb placement - only if agent moved (bomb goes at OLD position)
-        // Classic Bomberman: agent can't occupy same cell as bomb
-        if (place_bomb_action && moved) {
-            // Temporarily restore old position for place_bomb
-            int saved_x = agent->x;
-            int saved_y = agent->y;
+        // Bomb placement at OLD position (only if agent moved away)
+        if (wants_bomb && moved) {
+            int saved_x = agent->x, saved_y = agent->y;
             agent->x = old_x;
             agent->y = old_y;
             place_bomb(env, a);
-            // Restore new position
             agent->x = saved_x;
             agent->y = saved_y;
+        }
+    }
+
+    // 2.5. Power-up collection (Phase 3)
+    for (int a = 0; a < env->num_agents; a++) {
+        if (!env->agents[a].alive) continue;
+
+        Agent* agent = &env->agents[a];
+
+        // Check collision with all active power-ups
+        for (int p = 0; p < env->max_powerups; p++) {
+            if (env->powerups[p].active == 0) continue;
+
+            PowerUp* powerup = &env->powerups[p];
+
+            // Check if agent is on power-up
+            if (agent->x == powerup->x && agent->y == powerup->y) {
+                // Apply power-up effect
+                switch (powerup->type) {
+                    case 0:  // Extra bomb
+                        agent->bomb_count++;
+                        agent->max_bombs++;
+                        break;
+                    case 1:  // Blast radius
+                        agent->blast_radius++;
+                        break;
+                    case 2:  // Speed boost
+                        agent->speed_multiplier = 2.0f;  // Move every tick instead of every 2
+                        break;
+                }
+
+                // Deactivate power-up
+                powerup->active = 0;
+            }
         }
     }
 
@@ -858,52 +930,63 @@ void c_step(Bomberman* env) {
         }
     }
 
-    // 6. Victory condition: If only 1 agent alive, they win
-    if (env->agents_alive == 1) {
-        // Find the winner
-        for (int a = 0; a < env->num_agents; a++) {
-            if (env->agents[a].alive) {
-                Agent* winner = &env->agents[a];
+    // 6. Shrinking map logic (Phase 5 - Battle Royale)
+    if (env->tick >= env->shrink_start_tick) {
+        env->shrink_active = 1;
 
-                // Mark as winner (rank 1, best placement)
-                winner->rank = 1;
-                env->agents_eliminated++;
-                winner->alive = false;
-                env->terminals[a] = 1;
-                env->agents_alive--;
+        // Every shrink_rate ticks, shrink the safe zone by 1
+        int ticks_since_start = env->tick - env->shrink_start_tick;
+        if (ticks_since_start > 0 && ticks_since_start % env->shrink_rate == 0 && env->shrink_radius > 0) {
+            env->shrink_radius--;
 
-                // Remove from grid
-                int grid_idx = winner->y * env->width + winner->x;
-                if (env->grid[grid_idx] == AGENT_ID_OFFSET + a) {
-                    env->grid[grid_idx] = EMPTY;
+            // Spawn permanent fires at the new boundary
+            // For each cell, check if it's exactly at shrink_radius+1 distance (just outside new safe zone)
+            for (int y = 0; y < env->height; y++) {
+                for (int x = 0; x < env->width; x++) {
+                    int dist = abs(x - env->shrink_center_x) + abs(y - env->shrink_center_y);
+
+                    // Cell is exactly at old boundary (now outside safe zone)
+                    if (dist == env->shrink_radius + 1) {
+                        // Find inactive fire slot and spawn permanent fire
+                        for (int f = 0; f < env->max_fires; f++) {
+                            if (env->fires[f].remaining_ticks < 0) {
+                                env->fires[f].x = x;
+                                env->fires[f].y = y;
+                                env->fires[f].remaining_ticks = 9999;  // Permanent (won't expire)
+                                env->fires[f].owner = -1;  // Environment damage
+                                break;
+                            }
+                        }
+                    }
                 }
+            }
+        }
 
-                // Winner gets best placement reward + survival reward
-                float placement_reward = (float)(env->num_agents - winner->rank) / (float)env->num_agents;
-                Log* winner_log = &env->agent_logs[a];
-                float survival_reward = (float)winner_log->episode_length / (float)env->tick;
-                float total_reward = placement_reward + survival_reward;
+        // Damage agents outside safe zone (every tick while shrinking)
+        for (int a = 0; a < env->num_agents; a++) {
+            if (!env->agents[a].alive) continue;
 
-                env->rewards[a] += total_reward;
-                env->agent_logs[a].episode_return += total_reward;
+            Agent* agent = &env->agents[a];
+            int dist = abs(agent->x - env->shrink_center_x) + abs(agent->y - env->shrink_center_y);
 
-                // Update episode log
-                winner_log->score = total_reward;
-                winner_log->perf = winner_log->episode_length > 0 ? winner_log->score / winner_log->episode_length : 0.0f;
-
-                // Add to aggregate log
-                env->log.perf += winner_log->perf;
-                env->log.score += winner_log->score;
-                env->log.episode_return += winner_log->episode_return;
-                env->log.episode_length += winner_log->episode_length;
-                env->log.n += 1;
-
-                break;  // Only one winner
+            if (dist > env->shrink_radius) {
+                // Agent is outside safe zone - take damage
+                damage_agent(env, a, -1);  // -1 = environment damage
             }
         }
     }
 
-    // 7. Compute observations
+    // 7. Victory condition: If only 1 agent alive, they win
+    if (env->agents_alive == 1) {
+        for (int a = 0; a < env->num_agents; a++) {
+            if (env->agents[a].alive) {
+                finalize_agent(env, a, 1);  // Rank 1 = winner
+                break;
+            }
+        }
+    }
+
+    // 8. Compute observations
     compute_observations(env);
 }
 
@@ -932,7 +1015,7 @@ void c_render(Bomberman* env) {
         int window_width = env->width * 32;
         int window_height = env->height * 32;
         InitWindow(window_width, window_height, "Bomberman");
-        SetTargetFPS(10);
+        // Note: Don't use SetTargetFPS - Python controls tick rate via sleep in test_interactive.py
         env->client = (Client*)calloc(1, sizeof(Client));
     }
 
@@ -946,7 +1029,7 @@ void c_render(Bomberman* env) {
 
     int cell_size = 32;
 
-    // Draw grid
+    // Draw grid (with shrink zone warning overlay)
     for (int y = 0; y < env->height; y++) {
         for (int x = 0; x < env->width; x++) {
             int grid_idx = y * env->width + x;
@@ -956,7 +1039,16 @@ void c_render(Bomberman* env) {
             if (cell == HARD_WALL) color = PUFF_WALL;
             else if (cell == SOFT_WALL) color = PUFF_BLOCK;
 
-            if (cell != EMPTY) {
+            // Shrink zone warning: cells outside safe zone but not yet on fire
+            if (env->shrink_active) {
+                int dist = abs(x - env->shrink_center_x) + abs(y - env->shrink_center_y);
+                if (dist > env->shrink_radius && cell != HARD_WALL) {
+                    // Dark red tint for danger zone
+                    color = (Color){100, 20, 20, 255};
+                }
+            }
+
+            if (cell != EMPTY || (env->shrink_active && abs(x - env->shrink_center_x) + abs(y - env->shrink_center_y) > env->shrink_radius)) {
                 DrawRectangle(x * cell_size, y * cell_size, cell_size, cell_size, color);
             }
         }
@@ -980,6 +1072,35 @@ void c_render(Bomberman* env) {
                 env->bombs[b].x * cell_size + cell_size / 2,
                 env->bombs[b].y * cell_size + cell_size / 2,
                 cell_size / 3, PUFF_BOMB
+            );
+        }
+    }
+
+    // Draw power-ups (Phase 3)
+    for (int p = 0; p < env->max_powerups; p++) {
+        if (env->powerups[p].active) {
+            Color powerup_color;
+            switch (env->powerups[p].type) {
+                case 0:  // Extra bomb - Yellow
+                    powerup_color = (Color){255, 215, 0, 255};
+                    break;
+                case 1:  // Blast radius - Orange
+                    powerup_color = (Color){255, 140, 0, 255};
+                    break;
+                case 2:  // Speed - Cyan
+                    powerup_color = (Color){0, 255, 255, 255};
+                    break;
+                default:
+                    powerup_color = (Color){255, 255, 255, 255};
+            }
+
+            // Draw as small square
+            int offset = cell_size / 4;
+            int size = cell_size / 2;
+            DrawRectangle(
+                env->powerups[p].x * cell_size + offset,
+                env->powerups[p].y * cell_size + offset,
+                size, size, powerup_color
             );
         }
     }

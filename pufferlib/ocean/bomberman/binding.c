@@ -37,11 +37,15 @@ static int my_init(Env* env, PyObject* args, PyObject* kwargs) {
     // Example: 8 agents × 3 = 24 bomb slots
     env->max_bombs = env->num_agents * 3;
 
-    // max_fires: Maximum simultaneous fire cells from all explosions
-    // Formula: max_bombs × 12 (each bomb creates ~12 fire cells: 4 directions × 3 radius)
-    // Example: 24 bombs × 12 = 288 fire slots
-    // TODO: This will need revision for battle royale feature (shrinking map creates permanent fires)
-    env->max_fires = env->max_bombs * 12;
+    // max_fires: Bomb fires + shrink perimeter fires
+    // Bomb fires: max_bombs × 12 (each bomb creates ~12 fire cells)
+    // Shrink fires: ~4 × max(width, height) per shrink step (perimeter of diamond)
+    // Estimate ~width shrink steps, so shrink_fires ≈ 4 × width × width = 4 × width²
+    // But we only need active fires at once, and shrink uses damage_agent directly
+    // So keep reasonable size: bomb_fires + some buffer for shrink boundary
+    int bomb_fires = env->max_bombs * 12;
+    int shrink_buffer = 4 * (env->width + env->height);  // One perimeter ring
+    env->max_fires = bomb_fires + shrink_buffer;
 
     // max_powerups: Maximum power-ups on ground at once (Phase 3 feature)
     // Formula: num_agents × 2 (spawn rate limits to ~2 power-ups per agent)
