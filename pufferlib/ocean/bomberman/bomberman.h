@@ -66,7 +66,10 @@ typedef struct {
     float score;             // Score metric (environment-specific, unused for now)
     float episode_return;    // Sum of rewards over episode
     float episode_length;    // Total steps across all agent episodes
-    float n;                 // Number of completed agent episodes (for averaging metrics)
+    float walls_destroyed;   // Soft walls destroyed by this agent's bombs
+    float bombs_placed;      // Total bombs placed by this agent
+    float powerups_collected; // Total power-ups collected by this agent
+    float n;                 // Number of completed agent episodes (for averaging metrics) - MUST BE LAST
 } Log;
 
 /* Agent state
@@ -81,6 +84,9 @@ typedef struct {
     int blast_radius;        // Current blast radius (2-5 with power-ups)
     float speed_multiplier;  // Movement speed (1.0-2.0 with power-ups, Phase 3)
     int rank;                // Placement when eliminated (1=winner, N=first out)
+    int walls_destroyed;     // Soft walls destroyed by this agent's bombs (for logging)
+    int bombs_placed;        // Total bombs placed (for logging)
+    int powerups_collected;  // Total power-ups collected (for logging)
 } Agent;
 
 /* Bomb state
@@ -98,11 +104,10 @@ typedef struct {
  * Tracks fire cells from explosions
  * Uses fixed-size array with reuse (remaining_ticks<0 = inactive slot)
  */
-typedef struct {
-    int x, y;                // Position in grid
-    int remaining_ticks;     // How long fire persists (-1 = inactive slot)
-    int owner;               // Agent index of bomb owner (reserved for future kill tracking)
-} Fire;
+// Fire is now stored directly in grid arrays (fire_ticks, fire_owner)
+// This eliminates O(n) slot searches - all operations are O(1)
+// Old struct kept for reference but not used:
+// typedef struct { int x, y; int remaining_ticks; int owner; } Fire;
 
 /* PowerUp state (Phase 3 feature, observation channels added now)
  * Tracks power-ups on the ground
@@ -139,15 +144,16 @@ typedef struct {
     Agent* agents;               // Per-agent state
     char* grid;                  // Flat grid: grid[y*width + x]
     Bomb* bombs;                 // Fixed-size bomb array
-    Fire* fires;                 // Fixed-size fire array
     PowerUp* powerups;           // Fixed-size power-up array (Phase 3, allocated now)
     Log* agent_logs;             // Per-agent episode logs
 
-    // === SPATIAL LOOKUP GRIDS (O(1) entity lookups, -1 = empty) ===
+    // === SPATIAL LOOKUP GRIDS (O(1) entity lookups) ===
     int* agent_grid;             // agent_grid[y*width + x] = agent index or -1
     int* bomb_grid;              // bomb_grid[y*width + x] = bomb index or -1
-    int* fire_grid;              // fire_grid[y*width + x] = fire index or -1
+    int* fire_ticks;             // fire_ticks[y*width + x] = remaining ticks (0 = no fire)
+    int* fire_owner;             // fire_owner[y*width + x] = owner agent index (-1 = env/none)
     int* powerup_grid;           // powerup_grid[y*width + x] = powerup index or -1
+    int fire_count;              // Number of active fires (for early exit in iteration)
 
     // === WARM DATA (written per-agent during obs computation) ===
     float* observations;         // Per-agent observations (shared with Python)
@@ -158,7 +164,6 @@ typedef struct {
     int agents_alive;            // Count of agents with lives > 0
     int agents_eliminated;       // Count of eliminated agents (for ranking)
     int max_bombs;               // Size of bombs array
-    int max_fires;               // Size of fires array
     int max_powerups;            // Size of power-ups array (Phase 3)
     int vision;                  // Vision radius (fixed: 5)
     int window;                  // Vision window size (2*vision+1 = 11)
@@ -275,15 +280,16 @@ void init(Bomberman* env) {
     env->agent_logs = (Log*)calloc(env->num_agents, sizeof(Log));
     env->grid = (char*)calloc(env->width * env->height, sizeof(char));
     env->bombs = (Bomb*)calloc(env->max_bombs, sizeof(Bomb));
-    env->fires = (Fire*)calloc(env->max_fires, sizeof(Fire));
     env->powerups = (PowerUp*)calloc(env->max_powerups, sizeof(PowerUp));
 
     // Allocate spatial lookup grids (for O(1) entity lookups in observations)
     int grid_size = env->width * env->height;
     env->agent_grid = (int*)malloc(grid_size * sizeof(int));
     env->bomb_grid = (int*)malloc(grid_size * sizeof(int));
-    env->fire_grid = (int*)malloc(grid_size * sizeof(int));
+    env->fire_ticks = (int*)calloc(grid_size, sizeof(int));   // 0 = no fire
+    env->fire_owner = (int*)malloc(grid_size * sizeof(int));  // -1 = env/none
     env->powerup_grid = (int*)malloc(grid_size * sizeof(int));
+    env->fire_count = 0;
 
     // Initialize computed values
     env->window = 2 * env->vision + 1;  // 11
@@ -373,6 +379,12 @@ void generate_map(Bomberman* env) {
         }
     }
 
+    // Pre-calculate spawn positions once (avoid repeated calculation in loop)
+    int spawn_positions[64][2];  // Max 64 agents
+    for (int a = 0; a < env->num_agents; a++) {
+        get_spawn_position(env, a, &spawn_positions[a][0], &spawn_positions[a][1]);
+    }
+
     // Place soft blocks with symmetric mirroring (fairness for all spawn corners)
     // Algorithm: randomly place blocks, mirror to 3 other positions
     int num_interior_cells = (env->width - 2) * (env->height - 2);
@@ -414,8 +426,8 @@ void generate_map(Bomberman* env) {
             // This ensures all agents have clear spawn areas
             bool near_spawn = false;
             for (int a = 0; a < env->num_agents; a++) {
-                int spawn_x, spawn_y;
-                get_spawn_position(env, a, &spawn_x, &spawn_y);
+                int spawn_x = spawn_positions[a][0];
+                int spawn_y = spawn_positions[a][1];
 
                 // Check if within 1 cell of spawn (Manhattan distance)
                 int dist = abs(px - spawn_x) + abs(py - spawn_y);
@@ -498,6 +510,9 @@ void spawn_agent(Bomberman* env, int agent_idx) {
     agent->blast_radius = env->default_blast_radius;  // 2
     agent->speed_multiplier = 1.0f;  // Normal speed
     agent->rank = 0;  // Not yet eliminated
+    agent->walls_destroyed = 0;  // Reset per-episode stats
+    agent->bombs_placed = 0;
+    agent->powerups_collected = 0;
 
     // Clear agent's episode log
     env->agent_logs[agent_idx] = (Log){0};
@@ -540,6 +555,9 @@ bool place_bomb(Bomberman* env, int agent_idx) {
     // Decrement agent's available bombs
     agent->bomb_count--;
 
+    // Track for logging
+    agent->bombs_placed++;
+
     return true;
 }
 
@@ -580,6 +598,11 @@ void explode_bomb(Bomberman* env, int bomb_idx) {
             if (cell == SOFT_WALL) {
                 env->grid[grid_idx] = EMPTY;
 
+                // Track wall destruction for logging
+                if (owner >= 0 && owner < env->num_agents) {
+                    env->agents[owner].walls_destroyed++;
+                }
+
                 // Phase 3: Spawn power-up (30% chance)
                 if ((rand() % 100) < 30) {
                     // Find inactive power-up slot
@@ -599,18 +622,11 @@ void explode_bomb(Bomberman* env, int bomb_idx) {
                 break;  // Don't propagate through blocks
             }
 
-            // Create fire at this cell
-            // Find inactive fire slot
-            for (int f = 0; f < env->max_fires; f++) {
-                if (env->fires[f].remaining_ticks < 0) {
-                    env->fires[f].x = x;
-                    env->fires[f].y = y;
-                    env->fires[f].remaining_ticks = env->explosion_duration;
-                    env->fires[f].owner = owner;
-                    // Update fire spatial lookup grid
-                    env->fire_grid[grid_idx] = f;
-                    break;
-                }
+            // Create fire at this cell (skip if already has fire - O(1) check)
+            if (env->fire_ticks[grid_idx] == 0) {
+                env->fire_ticks[grid_idx] = env->explosion_duration;
+                env->fire_owner[grid_idx] = owner;
+                env->fire_count++;
             }
 
             // Chain reaction: trigger other bombs (O(1) lookup)
@@ -625,10 +641,12 @@ void explode_bomb(Bomberman* env, int bomb_idx) {
 /* === COLLISION DETECTION === */
 
 int check_fire_collision(Bomberman* env, int x, int y) {
-    // O(1) lookup using fire_grid
-    int fire_idx = env->fire_grid[y * env->width + x];
-    if (fire_idx >= 0 && env->fires[fire_idx].remaining_ticks > 0) {
-        return env->fires[fire_idx].owner;
+    // O(1) lookup using grid-based fire storage
+    // Fire exists if ticks > 0 (temporary) OR ticks == -1 (permanent shrink fire)
+    int grid_idx = y * env->width + x;
+    int ticks = env->fire_ticks[grid_idx];
+    if (ticks > 0 || ticks == -1) {
+        return env->fire_owner[grid_idx];
     }
     return -1;
 }
@@ -685,11 +703,19 @@ void finalize_agent(Bomberman* env, int agent_idx, int rank) {
     agent_log->score = reward;
     agent_log->perf = agent_log->episode_length > 0 ? agent_log->score / agent_log->episode_length : 0.0f;
 
+    // Add agent stats to agent log before aggregating
+    agent_log->walls_destroyed = (float)agent->walls_destroyed;
+    agent_log->bombs_placed = (float)agent->bombs_placed;
+    agent_log->powerups_collected = (float)agent->powerups_collected;
+
     // Add to aggregate log
     env->log.perf += agent_log->perf;
     env->log.score += agent_log->score;
     env->log.episode_return += agent_log->episode_return;
     env->log.episode_length += agent_log->episode_length;
+    env->log.walls_destroyed += agent_log->walls_destroyed;
+    env->log.bombs_placed += agent_log->bombs_placed;
+    env->log.powerups_collected += agent_log->powerups_collected;
     env->log.n += 1;
 }
 
@@ -697,19 +723,18 @@ void clear_entities(Bomberman* env) {
     for (int i = 0; i < env->max_bombs; i++) {
         env->bombs[i].timer = -1;
     }
-    for (int i = 0; i < env->max_fires; i++) {
-        env->fires[i].remaining_ticks = -1;
-    }
     for (int i = 0; i < env->max_powerups; i++) {
         env->powerups[i].active = 0;
     }
 
-    // Clear spatial lookup grids (set all to -1 = empty)
+    // Clear spatial lookup grids
     int grid_size = env->width * env->height;
     memset(env->agent_grid, -1, grid_size * sizeof(int));
     memset(env->bomb_grid, -1, grid_size * sizeof(int));
-    memset(env->fire_grid, -1, grid_size * sizeof(int));
+    memset(env->fire_ticks, 0, grid_size * sizeof(int));   // 0 = no fire
+    memset(env->fire_owner, -1, grid_size * sizeof(int));  // -1 = env/none
     memset(env->powerup_grid, -1, grid_size * sizeof(int));
+    env->fire_count = 0;
 }
 
 /* === OBSERVATION COMPUTATION === */
@@ -774,12 +799,10 @@ void compute_observations(Bomberman* env) {
                 }
                 env->observations[obs_idx++] = bomb_val;
 
-                // Channel 4: Fires (O(1) lookup)
-                float fire_val = 0.0f;
-                int f = env->fire_grid[grid_idx];
-                if (f >= 0 && env->fires[f].remaining_ticks > 0) {
-                    fire_val = 1.0f;
-                }
+                // Channel 4: Fires (O(1) lookup via grid)
+                // Fire exists if ticks > 0 (temporary) OR ticks == -1 (permanent)
+                int fire_t = env->fire_ticks[grid_idx];
+                float fire_val = (fire_t > 0 || fire_t == -1) ? 1.0f : 0.0f;
                 env->observations[obs_idx++] = fire_val;
 
                 // Channels 5-7: Power-ups (O(1) lookup)
@@ -971,6 +994,9 @@ void c_step(Bomberman* env) {
                     break;
             }
 
+            // Track for logging
+            agent->powerups_collected++;
+
             // Deactivate power-up and clear from grid
             powerup->active = 0;
             env->powerup_grid[grid_idx] = -1;
@@ -987,16 +1013,21 @@ void c_step(Bomberman* env) {
         }
     }
 
-    // 4. Update fires
-    for (int f = 0; f < env->max_fires; f++) {
-        if (env->fires[f].remaining_ticks < 0) continue;
-
-        env->fires[f].remaining_ticks--;
-
-        // Clear fire_grid when fire expires
-        if (env->fires[f].remaining_ticks < 0) {
-            int grid_idx = env->fires[f].y * env->width + env->fires[f].x;
-            env->fire_grid[grid_idx] = -1;
+    // 4. Update fires (grid-based - only iterate if there are temporary fires)
+    // fire_count only tracks temporary fires (from bombs), not permanent shrink fires
+    // Permanent fires use ticks = -1 (sentinel value, never decremented)
+    if (env->fire_count > 0) {
+        int grid_size = env->width * env->height;
+        int fires_found = 0;
+        for (int i = 0; i < grid_size && fires_found < env->fire_count; i++) {
+            // Only update temporary fires (positive ticks), skip permanent fires (-1)
+            if (env->fire_ticks[i] > 0) {
+                fires_found++;
+                env->fire_ticks[i]--;
+                if (env->fire_ticks[i] == 0) {
+                    env->fire_count--;
+                }
+            }
         }
     }
 
@@ -1012,7 +1043,8 @@ void c_step(Bomberman* env) {
     }
 
     // 6. Shrinking map logic (Phase 5 - Battle Royale)
-    if (env->tick >= env->shrink_start_tick) {
+    // Skip if all agents are dead (no need to shrink further)
+    if (env->agents_alive > 0 && env->tick >= env->shrink_start_tick) {
         env->shrink_active = 1;
 
         // Every shrink_rate ticks, shrink the safe zone by 1
@@ -1020,25 +1052,31 @@ void c_step(Bomberman* env) {
         if (ticks_since_start > 0 && ticks_since_start % env->shrink_rate == 0 && env->shrink_radius > 0) {
             env->shrink_radius--;
 
-            // Spawn permanent fires at the new boundary
-            // For each cell, check if it's exactly at shrink_radius+1 distance (just outside new safe zone)
-            for (int y = 0; y < env->height; y++) {
-                for (int x = 0; x < env->width; x++) {
-                    int dist = abs(x - env->shrink_center_x) + abs(y - env->shrink_center_y);
+            // Spawn permanent fires at the new boundary (optimized: only check perimeter cells)
+            // Diamond perimeter at distance d has ~4*d cells, much smaller than full grid scan
+            int d = env->shrink_radius + 1;  // Distance of new boundary
+            for (int i = 0; i <= d; i++) {
+                // Four points on the diamond at distance d: (±i, ±(d-i))
+                int offsets[4][2] = {
+                    {i, d - i}, {i, -(d - i)}, {-i, d - i}, {-i, -(d - i)}
+                };
+                for (int p = 0; p < 4; p++) {
+                    int x = env->shrink_center_x + offsets[p][0];
+                    int y = env->shrink_center_y + offsets[p][1];
 
-                    // Cell is exactly at old boundary (now outside safe zone)
-                    if (dist == env->shrink_radius + 1) {
-                        // Find inactive fire slot and spawn permanent fire
-                        for (int f = 0; f < env->max_fires; f++) {
-                            if (env->fires[f].remaining_ticks < 0) {
-                                env->fires[f].x = x;
-                                env->fires[f].y = y;
-                                env->fires[f].remaining_ticks = 9999;  // Permanent (won't expire)
-                                env->fires[f].owner = -1;  // Environment damage
-                                break;
-                            }
-                        }
-                    }
+                    // Skip out of bounds
+                    if (x < 0 || x >= env->width || y < 0 || y >= env->height) continue;
+
+                    int grid_idx = y * env->width + x;
+
+                    // Skip if already has fire (O(1) lookup) - check both temp (>0) and permanent (-1)
+                    if (env->fire_ticks[grid_idx] != 0) continue;
+
+                    // Spawn permanent fire directly in grid
+                    // Use -1 as sentinel for permanent fires (never decremented, not in fire_count)
+                    env->fire_ticks[grid_idx] = -1;   // Permanent (sentinel)
+                    env->fire_owner[grid_idx] = -1;   // Environment damage
+                    // NOTE: Don't increment fire_count - it only tracks temporary fires
                 }
             }
         }
@@ -1067,8 +1105,11 @@ void c_step(Bomberman* env) {
         }
     }
 
-    // 8. Compute observations
-    compute_observations(env);
+    // 8. Compute observations (skip if all agents dead - saves significant computation)
+    // Rewards are already given in finalize_agent() called from damage_agent()
+    if (env->agents_alive > 0) {
+        compute_observations(env);
+    }
 }
 
 /* === RENDERING === */
@@ -1135,14 +1176,16 @@ void c_render(Bomberman* env) {
         }
     }
 
-    // Draw fires
-    for (int f = 0; f < env->max_fires; f++) {
-        if (env->fires[f].remaining_ticks > 0) {
-            DrawRectangle(
-                env->fires[f].x * cell_size,
-                env->fires[f].y * cell_size,
-                cell_size, cell_size, PUFF_FIRE
-            );
+    // Draw fires (grid-based iteration)
+    // Must check entire grid since permanent fires (-1) aren't tracked in fire_count
+    for (int y = 0; y < env->height; y++) {
+        for (int x = 0; x < env->width; x++) {
+            int grid_idx = y * env->width + x;
+            int ticks = env->fire_ticks[grid_idx];
+            // Fire exists if ticks > 0 (temporary) OR ticks == -1 (permanent)
+            if (ticks > 0 || ticks == -1) {
+                DrawRectangle(x * cell_size, y * cell_size, cell_size, cell_size, PUFF_FIRE);
+            }
         }
     }
 
@@ -1208,13 +1251,13 @@ void c_close(Bomberman* env) {
     free(env->agent_logs);
     free(env->grid);
     free(env->bombs);
-    free(env->fires);
     free(env->powerups);
 
     // Free spatial lookup grids
     free(env->agent_grid);
     free(env->bomb_grid);
-    free(env->fire_grid);
+    free(env->fire_ticks);
+    free(env->fire_owner);
     free(env->powerup_grid);
 
     if (env->client != NULL) {

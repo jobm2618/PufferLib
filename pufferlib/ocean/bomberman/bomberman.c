@@ -27,7 +27,7 @@ int demo() {
 
     // Calculate derived values (from binding.c logic)
     env.max_bombs = env.num_agents * 3;
-    env.max_fires = env.max_bombs * 12;
+    // Note: Fires now use grid-based storage (fire_ticks/fire_owner arrays)
     env.max_powerups = env.num_agents * 2;
     env.tick = 0;
 
@@ -84,7 +84,7 @@ void test_performance(float test_time) {
 
     // Calculate derived values
     env.max_bombs = env.num_agents * 3;
-    env.max_fires = env.max_bombs * 12;
+    // Note: Fires now use grid-based storage (fire_ticks/fire_owner arrays)
     env.max_powerups = env.num_agents * 2;
     env.tick = 0;
 

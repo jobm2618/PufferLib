@@ -37,15 +37,8 @@ static int my_init(Env* env, PyObject* args, PyObject* kwargs) {
     // Example: 8 agents × 3 = 24 bomb slots
     env->max_bombs = env->num_agents * 3;
 
-    // max_fires: Bomb fires + shrink perimeter fires
-    // Bomb fires: max_bombs × 12 (each bomb creates ~12 fire cells)
-    // Shrink fires: ~4 × max(width, height) per shrink step (perimeter of diamond)
-    // Estimate ~width shrink steps, so shrink_fires ≈ 4 × width × width = 4 × width²
-    // But we only need active fires at once, and shrink uses damage_agent directly
-    // So keep reasonable size: bomb_fires + some buffer for shrink boundary
-    int bomb_fires = env->max_bombs * 12;
-    int shrink_buffer = 4 * (env->width + env->height);  // One perimeter ring
-    env->max_fires = bomb_fires + shrink_buffer;
+    // Note: Fires are now stored directly in fire_ticks/fire_owner grids (size = width * height)
+    // This eliminates the old max_fires limitation and removes O(n) slot searches
 
     // max_powerups: Maximum power-ups on ground at once (Phase 3 feature)
     // Formula: num_agents × 2 (spawn rate limits to ~2 power-ups per agent)
@@ -76,5 +69,8 @@ static int my_log(PyObject* dict, Log* log) {
     assign_to_dict(dict, "score", log->score);
     assign_to_dict(dict, "episode_return", log->episode_return);
     assign_to_dict(dict, "episode_length", log->episode_length);
+    assign_to_dict(dict, "walls_destroyed", log->walls_destroyed);
+    assign_to_dict(dict, "bombs_placed", log->bombs_placed);
+    assign_to_dict(dict, "powerups_collected", log->powerups_collected);
     return 0;
 }
