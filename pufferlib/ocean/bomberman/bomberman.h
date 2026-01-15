@@ -250,13 +250,19 @@ void finalize_agent(Bomberman* env, int agent_idx, int rank);
  */
 void clear_entities(Bomberman* env);
 
-/* Spawn agent at random empty position
- * Used at reset and respawn (if implemented)
+/* Calculate spawn position for an agent (deterministic, based on agent index)
+ * Returns position via pointers
+ */
+void get_spawn_position(Bomberman* env, int agent_idx, int* out_x, int* out_y);
+
+/* Spawn agent at its designated spawn position
+ * Position is calculated deterministically based on agent index
  */
 void spawn_agent(Bomberman* env, int agent_idx);
 
 /* Generate random map with soft blocks
  * Border is hard walls, interior has random soft blocks
+ * Clears 2×2 area around each agent's spawn position
  */
 void generate_map(Bomberman* env);
 
@@ -292,6 +298,55 @@ void init(Bomberman* env) {
 
     // Initialize rendering client as NULL (created on first render)
     env->client = NULL;
+}
+
+/* === SPAWN POSITION CALCULATION === */
+
+// Calculate spawn position for an agent (deterministic, based on agent index)
+// Returns position via pointers, ensures position is on odd coordinates (not on hard walls)
+void get_spawn_position(Bomberman* env, int agent_idx, int* out_x, int* out_y) {
+    // Distribute agents evenly around the grid perimeter
+    // We use the inner ring (1 cell from border) for spawning
+    int inner_width = env->width - 2;   // Walkable width (excluding walls)
+    int inner_height = env->height - 2; // Walkable height (excluding walls)
+
+    // Perimeter of inner walkable area
+    int perimeter = 2 * inner_width + 2 * inner_height - 4;
+
+    // Calculate position along perimeter for this agent
+    int pos = (agent_idx * perimeter) / env->num_agents;
+
+    int x, y;
+
+    if (pos < inner_width) {
+        // Top edge: left to right
+        x = 1 + pos;
+        y = 1;
+    } else if (pos < inner_width + inner_height - 1) {
+        // Right edge: top to bottom
+        x = env->width - 2;
+        y = 1 + (pos - inner_width);
+    } else if (pos < 2 * inner_width + inner_height - 2) {
+        // Bottom edge: right to left
+        x = env->width - 2 - (pos - inner_width - inner_height + 1);
+        y = env->height - 2;
+    } else {
+        // Left edge: bottom to top
+        x = 1;
+        y = env->height - 2 - (pos - 2 * inner_width - inner_height + 2);
+    }
+
+    // Ensure we don't spawn on hard walls (classic Bomberman grid pattern at even x,y)
+    // If position is on a hard wall, nudge to nearest odd position
+    if (x > 1 && x < env->width - 2 && x % 2 == 0) {
+        x = (x + 1 < env->width - 2) ? x + 1 : x - 1;
+    }
+    if (y > 1 && y < env->height - 2 && y % 2 == 0) {
+        y = (y + 1 < env->height - 2) ? y + 1 : y - 1;
+    }
+
+    *out_x = x;
+    *out_y = y;
 }
 
 /* === MAP GENERATION === */
@@ -355,14 +410,22 @@ void generate_map(Bomberman* env) {
                 break;
             }
 
-            // Check spawn corners (keep 2×2 area clear at corners)
-            bool is_spawn_corner = false;
-            if (px <= 2 && py <= 2) is_spawn_corner = true;  // Top-left
-            if (px >= env->width - 3 && py <= 2) is_spawn_corner = true;  // Top-right
-            if (px <= 2 && py >= env->height - 3) is_spawn_corner = true;  // Bottom-left
-            if (px >= env->width - 3 && py >= env->height - 3) is_spawn_corner = true;  // Bottom-right
+            // Check if position is near any spawn point (within 1 cell)
+            // This ensures all agents have clear spawn areas
+            bool near_spawn = false;
+            for (int a = 0; a < env->num_agents; a++) {
+                int spawn_x, spawn_y;
+                get_spawn_position(env, a, &spawn_x, &spawn_y);
 
-            if (is_spawn_corner) {
+                // Check if within 1 cell of spawn (Manhattan distance)
+                int dist = abs(px - spawn_x) + abs(py - spawn_y);
+                if (dist <= 1) {
+                    near_spawn = true;
+                    break;
+                }
+            }
+
+            if (near_spawn) {
                 valid = false;
                 break;
             }
@@ -388,6 +451,34 @@ void generate_map(Bomberman* env) {
 
     // Note: blocks_placed may exceed num_blocks slightly due to 4-block placement
     // This is acceptable for fairness - ensures all corners have identical patterns
+
+    // Clear 2×2 spawn areas for all agents
+    // Each agent needs their spawn cell + adjacent cells to be clear of soft blocks
+    for (int a = 0; a < env->num_agents; a++) {
+        int spawn_x, spawn_y;
+        get_spawn_position(env, a, &spawn_x, &spawn_y);
+
+        // Clear spawn cell and all 4 adjacent cells (if they're soft blocks)
+        // This guarantees at least one escape route
+        for (int dy = -1; dy <= 1; dy++) {
+            for (int dx = -1; dx <= 1; dx++) {
+                // Skip diagonals - only clear orthogonal neighbors and center
+                if (dx != 0 && dy != 0) continue;
+
+                int cx = spawn_x + dx;
+                int cy = spawn_y + dy;
+
+                // Check bounds
+                if (cx < 1 || cx >= env->width - 1 || cy < 1 || cy >= env->height - 1) continue;
+
+                int idx = cy * env->width + cx;
+                // Only clear soft blocks (don't touch hard walls)
+                if (env->grid[idx] == SOFT_WALL) {
+                    env->grid[idx] = EMPTY;
+                }
+            }
+        }
+    }
 }
 
 /* === AGENT MANAGEMENT === */
@@ -395,47 +486,8 @@ void generate_map(Bomberman* env) {
 void spawn_agent(Bomberman* env, int agent_idx) {
     Agent* agent = &env->agents[agent_idx];
 
-    // Distribute agents evenly around the grid perimeter
-    // Perimeter length: 2*(width-2) + 2*(height-2) = 2*width + 2*height - 8
-    // We use the inner ring (1 cell from border) for spawning
-    int inner_width = env->width - 2;   // Walkable width (excluding walls)
-    int inner_height = env->height - 2; // Walkable height (excluding walls)
-
-    // Perimeter of inner walkable area
-    // Top edge: inner_width cells, Right edge: inner_height-1, Bottom: inner_width-1, Left: inner_height-2
-    int perimeter = 2 * inner_width + 2 * inner_height - 4;
-
-    // Calculate position along perimeter for this agent
-    int pos = (agent_idx * perimeter) / env->num_agents;
-
     int x, y;
-
-    if (pos < inner_width) {
-        // Top edge: left to right
-        x = 1 + pos;
-        y = 1;
-    } else if (pos < inner_width + inner_height - 1) {
-        // Right edge: top to bottom
-        x = env->width - 2;
-        y = 1 + (pos - inner_width);
-    } else if (pos < 2 * inner_width + inner_height - 2) {
-        // Bottom edge: right to left
-        x = env->width - 2 - (pos - inner_width - inner_height + 1);
-        y = env->height - 2;
-    } else {
-        // Left edge: bottom to top
-        x = 1;
-        y = env->height - 2 - (pos - 2 * inner_width - inner_height + 2);
-    }
-
-    // Ensure we don't spawn on hard walls (classic Bomberman grid pattern at even x,y)
-    // If position is on a hard wall, nudge to nearest odd position
-    if (x > 1 && x < env->width - 2 && x % 2 == 0) {
-        x = (x + 1 < env->width - 2) ? x + 1 : x - 1;
-    }
-    if (y > 1 && y < env->height - 2 && y % 2 == 0) {
-        y = (y + 1 < env->height - 2) ? y + 1 : y - 1;
-    }
+    get_spawn_position(env, agent_idx, &x, &y);
 
     agent->x = x;
     agent->y = y;
@@ -623,16 +675,14 @@ void finalize_agent(Bomberman* env, int agent_idx, int rank) {
     }
 
     // Calculate rewards
-    // Placement: (N - rank) / N  →  rank 1 = best, rank N = worst
-    float placement_reward = (float)(env->num_agents - rank) / (float)env->num_agents;
-    // Survival: steps_survived / total_ticks
-    float survival_reward = (env->tick > 0) ? (float)agent_log->episode_length / (float)env->tick : 0.0f;
-    float total_reward = placement_reward + survival_reward;
+    // Placement only: (N - rank) / N  →  rank 1 (winner) = best, rank N (first out) = worst
+    // Examples for 16 agents: winner=0.94, 2nd=0.88, ..., last=0.0
+    float reward = (float)(env->num_agents - rank) / (float)env->num_agents;
 
     // Apply rewards
-    env->rewards[agent_idx] += total_reward;
-    agent_log->episode_return += total_reward;
-    agent_log->score = total_reward;
+    env->rewards[agent_idx] += reward;
+    agent_log->episode_return += reward;
+    agent_log->score = reward;
     agent_log->perf = agent_log->episode_length > 0 ? agent_log->score / agent_log->episode_length : 0.0f;
 
     // Add to aggregate log
@@ -868,11 +918,15 @@ void c_step(Bomberman* env) {
             // Check bounds and collisions
             if (new_x >= 0 && new_x < env->width &&
                 new_y >= 0 && new_y < env->height) {
-                char cell = env->grid[new_y * env->width + new_x];
-                if (cell == EMPTY) {
+                int new_idx = new_y * env->width + new_x;
+                char cell = env->grid[new_idx];
+                int other_agent = env->agent_grid[new_idx];
+
+                // Can only move to empty cells with no other agent
+                if (cell == EMPTY && other_agent < 0) {
                     // Update agent_grid: clear old position, set new position
                     env->agent_grid[old_y * env->width + old_x] = -1;
-                    env->agent_grid[new_y * env->width + new_x] = a;
+                    env->agent_grid[new_idx] = a;
                     agent->x = new_x;
                     agent->y = new_y;
                     moved = true;
@@ -1042,7 +1096,7 @@ void c_render(Bomberman* env) {
         int window_width = env->width * 32;
         int window_height = env->height * 32;
         InitWindow(window_width, window_height, "Bomberman");
-        // Note: Don't use SetTargetFPS - Python controls tick rate via sleep in test_interactive.py
+        SetTargetFPS(0);  // Disable vsync/frame limiting - Python controls tick rate
         env->client = (Client*)calloc(1, sizeof(Client));
     }
 
