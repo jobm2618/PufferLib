@@ -78,6 +78,7 @@ typedef struct {
  */
 typedef struct {
     int x, y;                // Position in grid
+    int prev_x, prev_y;      // Previous position (for dodge detection)
     bool alive;              // true=alive, false=dead (0 lives remaining)
     int remaining_lives;     // 3, 2, 1, or 0 (0 = dead)
     int bomb_count;          // Current bombs available to place
@@ -509,6 +510,8 @@ void spawn_agent(Bomberman* env, int agent_idx) {
 
     agent->x = x;
     agent->y = y;
+    agent->prev_x = x;  // Initialize prev position (for dodge detection)
+    agent->prev_y = y;
     agent->alive = true;
     agent->remaining_lives = 3;  // Start with 3 lives
     agent->bomb_count = 1;  // Start with 1 bomb
@@ -564,6 +567,11 @@ bool place_bomb(Bomberman* env, int agent_idx) {
     // Track for logging
     agent->bombs_placed++;
 
+    // Bomb placement reward (bootstrap learning, kept low to avoid spam)
+    // Scale: Low (0.01) - just enough to encourage trying bombs
+    env->rewards[agent_idx] += 0.01f;
+    env->agent_logs[agent_idx].episode_return += 0.01f;
+
     return true;
 }
 
@@ -604,9 +612,14 @@ void explode_bomb(Bomberman* env, int bomb_idx) {
             if (cell == SOFT_WALL) {
                 env->grid[grid_idx] = EMPTY;
 
-                // Track wall destruction for logging
+                // Track wall destruction for logging + reward
                 if (owner >= 0 && owner < env->num_agents) {
                     env->agents[owner].walls_destroyed++;
+
+                    // Block destruction reward
+                    // Scale: Low (0.1) - exploration signal, happens relatively frequently
+                    env->rewards[owner] += 0.1f;
+                    env->agent_logs[owner].episode_return += 0.1f;
                 }
 
                 // Phase 3: Spawn power-up (30% chance)
@@ -633,6 +646,20 @@ void explode_bomb(Bomberman* env, int bomb_idx) {
                 env->fire_ticks[grid_idx] = env->explosion_duration;
                 env->fire_owner[grid_idx] = owner;
                 env->fire_count++;
+
+                // Dodge detection: reward agents who moved away from this fire cell
+                // Agent was here last tick (prev_x, prev_y) but moved away this tick
+                for (int a = 0; a < env->num_agents; a++) {
+                    if (!env->agents[a].alive) continue;
+                    Agent* ag = &env->agents[a];
+                    // Was here last tick, now somewhere else
+                    if (ag->prev_x == x && ag->prev_y == y &&
+                        (ag->x != x || ag->y != y)) {
+                        // Dodge reward: less than damage (-0.3) so walking through fire still viable
+                        env->rewards[a] += 0.1f;
+                        env->agent_logs[a].episode_return += 0.1f;
+                    }
+                }
             }
 
             // Chain reaction: trigger other bombs (O(1) lookup)
@@ -640,6 +667,20 @@ void explode_bomb(Bomberman* env, int bomb_idx) {
             if (other_bomb >= 0 && env->bombs[other_bomb].timer >= 0) {
                 explode_bomb(env, other_bomb);  // Recursive!
             }
+        }
+    }
+
+    // Safe bomb reward: check if owner escaped their own bomb
+    // If owner is alive and NOT standing on any fire cell we just created, reward them
+    if (owner >= 0 && owner < env->num_agents && env->agents[owner].alive) {
+        int owner_grid_idx = env->agents[owner].y * env->width + env->agents[owner].x;
+        // Check if owner's position has fire owned by them (from this or any of their bombs)
+        // fire_owner tracks who created the fire
+        if (env->fire_ticks[owner_grid_idx] == 0 || env->fire_owner[owner_grid_idx] != owner) {
+            // Owner is not standing in their own fire - safe bomb!
+            // Scale: More valuable than placement since it shows skill
+            env->rewards[owner] += 0.2f;
+            env->agent_logs[owner].episode_return += 0.2f;
         }
     }
 }
@@ -665,6 +706,19 @@ void damage_agent(Bomberman* env, int agent_idx, int killer_idx) {
 
     // Lose 1 life
     agent->remaining_lives--;
+
+    // Damage penalty for victim
+    // Scale: Snake death=-1.0, but we have 3 lives so -0.3 per hit
+    env->rewards[agent_idx] -= 0.3f;
+    env->agent_logs[agent_idx].episode_return -= 0.3f;
+
+    // Damage reward for killer (if valid and not self/environment)
+    // Scaled by num_agents so max total ≈ 1.0 regardless of agent count
+    if (killer_idx >= 0 && killer_idx != agent_idx && killer_idx < env->num_agents) {
+        float damage_reward = (1.0f-((float)env->agents_alive/(float)env->num_agents));
+        env->rewards[killer_idx] += damage_reward;
+        env->agent_logs[killer_idx].episode_return += damage_reward;
+    }
 
     // Check if agent is eliminated (0 lives remaining)
     if (agent->remaining_lives <= 0) {
@@ -893,11 +947,11 @@ void c_reset(Bomberman* env) {
     int interior_cells = (env->width - 2) * (env->height - 2);
     int soft_walls = (int)(interior_cells * env->block_density);
     int walls_per_agent = soft_walls / env->num_agents;
-    int ticks_per_wall = env->bomb_timer + env->explosion_duration;  // 5 + 3 = 8
+    int ticks_per_wall = env->bomb_timer + env->explosion_duration + 2* env->default_blast_radius;  // 5 + 3 + 2 *2 = 12
     int base_time = walls_per_agent * ticks_per_wall;
     env->shrink_start_tick = (int)(base_time * 1.5f);
 
-    env->shrink_rate = 2;  // Shrink every 2 ticks (slow enough to outrun)
+    env->shrink_rate = 4;  // Shrink every 4 ticks (slow enough to outrun and still play)
     env->shrink_radius = (env->width + env->height) / 2;  // Start with large radius
     env->shrink_active = 0;
 
@@ -946,6 +1000,11 @@ void c_step(Bomberman* env) {
         if (!env->agents[a].alive) continue;
 
         Agent* agent = &env->agents[a];
+
+        // Save previous position for dodge detection (before any movement)
+        agent->prev_x = agent->x;
+        agent->prev_y = agent->y;
+
         int action = env->actions[a];
         if (action < 0 || action >= NUM_ACTIONS) continue;
 
@@ -1021,6 +1080,10 @@ void c_step(Bomberman* env) {
 
             // Track for logging
             agent->powerups_collected++;
+
+            // Power-up collection reward
+            env->rewards[a] += 0.2f;
+            env->agent_logs[a].episode_return += 0.1f;
 
             // Deactivate power-up and clear from grid
             powerup->active = 0;
@@ -1172,7 +1235,7 @@ void c_render(Bomberman* env) {
         int window_width = env->width * 32;
         int window_height = env->height * 32;
         InitWindow(window_width, window_height, "Bomberman");
-        SetTargetFPS(0);  // Disable vsync/frame limiting - Python controls tick rate
+        SetTargetFPS(3);  
         env->client = (Client*)calloc(1, sizeof(Client));
     }
 
