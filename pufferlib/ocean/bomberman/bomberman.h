@@ -6,6 +6,7 @@
 #include <string.h>
 #include <math.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include "raylib.h"
 
 // Grid cell types (stored in grid array as char)
@@ -183,6 +184,9 @@ typedef struct {
     int shrink_center_y;         // Random target center Y
     int shrink_active;           // 0=not started, 1=shrinking
 
+    // === AUTO-RESET STATE ===
+    int needs_reset;             // 1 = reset on next step (delayed reset for PufferLib compatibility)
+
     // === RENDERING (only used if render() called) ===
     Client* client;              // Raylib client (NULL until first render)
 } Bomberman;
@@ -298,6 +302,8 @@ void init(Bomberman* env) {
     // Initialize counters
     env->agents_alive = env->num_agents;
     env->agents_eliminated = 0;
+    env->needs_reset = 0;  // No pending reset
+
 
     // Mark all entities as inactive
     clear_entities(env);
@@ -675,6 +681,9 @@ void finalize_agent(Bomberman* env, int agent_idx, int rank) {
     Agent* agent = &env->agents[agent_idx];
     Log* agent_log = &env->agent_logs[agent_idx];
 
+    // Guard: prevent double-finalization which would corrupt agents_alive counter
+    if (!agent->alive) return;
+
     // Set final state
     agent->rank = rank;
     agent->alive = false;
@@ -850,6 +859,7 @@ void c_reset(Bomberman* env) {
     // This is independent from Python's global tick counter
     env->tick = 0;
     env->log = (Log){0};
+    env->needs_reset = 0;  // Clear delayed reset flag
 
     // Reset counters
     env->agents_alive = env->num_agents;
@@ -902,15 +912,30 @@ void c_reset(Bomberman* env) {
 /* === STEP === */
 
 void c_step(Bomberman* env) {
+    // 0. Check for delayed reset (from previous tick when all agents died)
+    // This allows PufferLib to see terminal=1 for one full tick before we reset
+    if (env->needs_reset) {
+        c_reset(env);
+        return;  // Observations already computed in c_reset
+    }
+
     env->tick++;
 
-    // 1. Clear per-step state (rewards only - terminals persist once set)
-    for (int a = 0; a < env->num_agents; a++) {
-        env->rewards[a] = 0.0f;
-        // NOTE: Do NOT reset terminals - they persist once an agent is eliminated
-        // env->terminals[a] is set to 1 in damage_agent() when remaining_lives <= 0
+    // 1. Clear per-step state (BOTH rewards AND terminals)
+    // CRITICAL: terminals MUST be cleared at start of each step!
+    //
+    // Why: PufferLib interprets terminal=1 as "this agent's episode ended THIS step".
+    // If we leave terminal=1 permanently for dead agents, PufferLib sees them as
+    // "ending their episode" every single step, which causes the training freeze.
+    //
+    // The correct pattern (from Battle env): clear all terminals at step start,
+    // then set terminal=1 ONLY for agents that die during THIS step.
+    // Dead agents from previous steps should have terminal=0.
+    memset(env->rewards, 0, env->num_agents * sizeof(float));
+    memset(env->terminals, 0, env->num_agents * sizeof(unsigned char));
 
-        // Increment episode length for alive agents
+    // Increment episode length for alive agents
+    for (int a = 0; a < env->num_agents; a++) {
         if (env->agents[a].alive) {
             env->agent_logs[a].episode_length += 1;
         }
@@ -1105,11 +1130,21 @@ void c_step(Bomberman* env) {
         }
     }
 
-    // 8. Compute observations (skip if all agents dead - saves significant computation)
-    // Rewards are already given in finalize_agent() called from damage_agent()
-    if (env->agents_alive > 0) {
-        compute_observations(env);
+    // 8. Schedule delayed reset when episode ends (all agents terminal)
+    // This is required because PufferEnv.done returns False for native envs
+    // Without auto-reset, PufferLib would keep stepping a dead environment
+    //
+    // IMPORTANT: We use delayed reset (needs_reset flag) instead of immediate reset
+    // so that PufferLib can see terminal=1 states for one full tick before reset.
+    // This prevents race conditions where PufferLib misses the terminal signals.
+    if (env->agents_alive == 0) {
+        env->needs_reset = 1;  // Schedule reset for next step
+        // Don't compute observations - all agents are dead, keep terminal states visible
+        return;
     }
+
+    // 9. Compute observations for living agents
+    compute_observations(env);
 }
 
 /* === RENDERING === */
